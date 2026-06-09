@@ -1,0 +1,47 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Notebook and editor noise
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.code-workspace
+
+# OS / desktop noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local logs and temp files
+*.log
+*.tmp
+*.temp
+
+# Isaac / run-time byproducts if created locally
+*.sqlite
+*.db
+
+reference/
+legacy/
+output/
+
+baselines/results/
+baselines/figures/

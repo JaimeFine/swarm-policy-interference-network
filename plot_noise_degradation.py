@@ -13,12 +13,13 @@ INPUT_CSV = ROOT / "noise_robustness_results" / "noise_robustness_raw.csv"
 OUTPUT_PDF = ROOT / "noise_robustness_results" / "noise_degradation_comparison.pdf"
 OUTPUT_PNG = ROOT / "noise_robustness_results" / "noise_degradation_comparison.png"
 
-METHOD_ORDER = ("spin", "apf_velocity", "cbba")
+METHOD_ORDER = ("spin", "apf_velocity", "cbba", "mappo")
 MODE_ORDER = ("tracking", "multi_goal")
 METHOD_LABELS = {
     "spin": "SPIN",
     "apf_velocity": "APF-Velocity",
     "cbba": "CBBA",
+    "mappo": "MAPPO",
 }
 MODE_LABELS = {
     "tracking": "Tracking",
@@ -28,6 +29,7 @@ COLORS = {
     "spin": "#1d4ed8",
     "apf_velocity": "#059669",
     "cbba": "#dc2626",
+    "mappo": "#7c3aed",
 }
 
 

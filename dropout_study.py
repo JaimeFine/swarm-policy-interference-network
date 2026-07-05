@@ -11,6 +11,7 @@ import numpy as np
 
 from baselines.apf_velocity import APFVelocityController
 from baselines.cbba import DistributedAuctionCBBAController
+from baselines.mappo import build_reference_mappo_controller_from_checkpoint
 from src.network import forward_pass
 from src.pettingzoo_env import (
     _make_env,
@@ -35,7 +36,8 @@ from src.spin_policy import (
 from src.topology import compute_adjacency_matrix, extract_overlapping_maximal_cliques
 
 OUTDIR = Path(__file__).resolve().parent / "dropout_robustness_results"
-METHODS = ("spin", "apf_velocity", "cbba")
+MAPPO_RUNS_ROOT = Path(__file__).resolve().parent / "baselines" / "results" / "mappo_convergence_runs"
+METHODS = ("spin", "apf_velocity", "cbba", "mappo")
 MODES = ("tracking", "multi_goal")
 DROP_RATES = (0.0, 0.1, 0.25, 0.4, 0.6)
 TRIALS = 5
@@ -77,6 +79,8 @@ def pretty_method_name(method: str) -> str:
         return "APF-Velocity"
     if method == "cbba":
         return "CBBA"
+    if method == "mappo":
+        return "MAPPO"
     return "SPIN"
 
 
@@ -161,11 +165,51 @@ def _apply_coordinate_dropout(
     return values * keep_mask.astype(float)
 
 
-def _build_baseline_controller(method: str, n_agents: int):
+def _latest_completed_mappo_run_dir(explicit_run_dir: Path | None = None) -> Path:
+    if explicit_run_dir is not None:
+        run_dir = Path(explicit_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"MAPPO run directory does not exist: {run_dir}")
+        return run_dir
+
+    if not MAPPO_RUNS_ROOT.exists():
+        raise FileNotFoundError(
+            f"No MAPPO convergence runs found under: {MAPPO_RUNS_ROOT}"
+        )
+
+    candidates = sorted(
+        [path for path in MAPPO_RUNS_ROOT.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        if all(
+            (run_dir / "training" / "mappo" / mode / "convergence" / "converged_model" / "actor.pt").exists()
+            for mode in MODES
+        ):
+            return run_dir
+    raise FileNotFoundError(
+        f"No completed MAPPO convergence run with converged checkpoints for modes {MODES} was found."
+    )
+
+
+def _build_baseline_controller(method: str, n_agents: int, mappo_run_dir: Path | None = None, *, mode: str | None = None):
     if method == "apf_velocity":
         return APFVelocityController(n_agents=n_agents)
     if method == "cbba":
         return DistributedAuctionCBBAController(n_agents=n_agents)
+    if method == "mappo":
+        if mode is None:
+            raise ValueError("MAPPO controller construction requires a mode.")
+        run_dir = _latest_completed_mappo_run_dir(mappo_run_dir)
+        model_dir = run_dir / "training" / "mappo" / mode / "convergence" / "converged_model"
+        return build_reference_mappo_controller_from_checkpoint(
+            mode=mode,
+            n_agents=n_agents,
+            steps=STEPS,
+            model_dir=model_dir,
+            seed=BASE_SEED + MODE_SEED_OFFSET[mode],
+        )
     raise ValueError(f"Unsupported baseline method: {method}")
 
 
@@ -230,11 +274,12 @@ def run_dropout_baseline_episode(
     steps: int,
     seed: int,
     drop_rate: float,
+    controller=None,
 ) -> dict[str, float | int | str]:
     env = _make_env(mode=mode, n_agents=n_agents, steps=steps)
     env.reset(seed=seed)
     rng = np.random.default_rng(seed + 12345)
-    controller = _build_baseline_controller(method, n_agents)
+    controller = controller or _build_baseline_controller(method, n_agents, mode=mode)
     controller.reset(seed=seed)
 
     final_task = None
@@ -245,15 +290,17 @@ def run_dropout_baseline_episode(
     for step_idx in range(steps):
         true_positions = env.agent_positions.copy()
         true_landmarks = env.landmark_positions.copy()
+        true_velocities = env.agent_velocities.copy()
         perceived_positions = _apply_coordinate_dropout(rng, true_positions, drop_rate)
         perceived_landmarks = _apply_coordinate_dropout(rng, true_landmarks, drop_rate)
+        perceived_velocities = _apply_coordinate_dropout(rng, true_velocities, drop_rate)
 
         actions, diagnostics = controller.act(
             mode,
             perceived_positions,
             perceived_landmarks,
             step_idx,
-            agent_velocities=env.agent_velocities.copy(),
+            agent_velocities=perceived_velocities,
         )
         _, _, terminations, truncations, _ = env.step(actions)
 
@@ -334,6 +381,7 @@ def plot_summary(summary_rows: list[dict[str, float | int | str]], path: Path) -
         "spin": "#1d4ed8",
         "apf_velocity": "#059669",
         "cbba": "#dc2626",
+        "mappo": "#7c3aed",
     }
 
     for ax, mode in zip(axes, MODES):
@@ -378,6 +426,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--agents", type=int, default=AGENTS)
     parser.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
+    parser.add_argument(
+        "--mappo-run-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a completed MAPPO convergence run directory. Defaults to the most recent completed run.",
+    )
     return parser.parse_args()
 
 
@@ -386,6 +440,16 @@ def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(BASE_SEED)
     phi_omega = pretrain_mlp(epochs=args.epochs)
+    mappo_run_dir = _latest_completed_mappo_run_dir(args.mappo_run_dir)
+    mappo_controllers = {
+        mode: _build_baseline_controller("mappo", args.agents, mappo_run_dir, mode=mode)
+        for mode in MODES
+    }
+    print(
+        "Including MAPPO from converged checkpoints at: "
+        f"{mappo_run_dir}\n"
+        "Note: MAPPO was trained on clean observations, so the dropout study is an out-of-distribution robustness evaluation for MAPPO."
+    )
 
     raw_rows: list[dict[str, float | int | str]] = []
     total_jobs = len(METHODS) * len(MODES) * len(DROP_RATES) * args.trials
@@ -427,6 +491,7 @@ def main() -> None:
                             steps=args.steps,
                             seed=seed,
                             drop_rate=drop_rate,
+                            controller=mappo_controllers.get(mode) if method == "mappo" else None,
                         )
                     raw_rows.append(row)
                     completed += 1
@@ -453,6 +518,11 @@ def main() -> None:
     print(f"Saved dropout raw CSV to: {raw_csv}")
     print(f"Saved dropout summary CSV to: {summary_csv}")
     print(f"Saved dropout robustness figure to: {saved_figure_path}")
+    for controller in mappo_controllers.values():
+        if hasattr(controller, "runner") and hasattr(controller.runner, "envs"):
+            controller.runner.envs.close()
+        if hasattr(controller, "runner") and hasattr(controller.runner, "writter"):
+            controller.runner.writter.close()
 
 
 if __name__ == "__main__":

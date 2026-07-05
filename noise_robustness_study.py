@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import time
 from collections import defaultdict
@@ -10,7 +11,7 @@ import numpy as np
 
 from baselines.apf_velocity import APFVelocityController
 from baselines.cbba import DistributedAuctionCBBAController
-from src.coverage import modulate_exploration_probabilities
+from baselines.mappo import build_reference_mappo_controller_from_checkpoint
 from src.network import forward_pass
 from src.pettingzoo_env import (
     _make_env,
@@ -19,7 +20,6 @@ from src.pettingzoo_env import (
     scenario_targets,
 )
 from src.quantum import (
-    LocalQuantumState,
     apply_radon_nikodym_filter,
     compute_clique_reduced_densities,
     evaluate_born_probabilities,
@@ -29,7 +29,6 @@ from src.simulation import pretrain_mlp
 from src.spin_policy import (
     GAMMA_CLAMPING,
     MAX_CLIQUE_NEIGHBORS,
-    N_BEHAVIORS,
     SpinPolicyController,
     compute_policy_signal,
     mean_policy_entropy,
@@ -37,12 +36,14 @@ from src.spin_policy import (
 from src.topology import compute_adjacency_matrix, extract_overlapping_maximal_cliques
 
 OUTDIR = Path(__file__).resolve().parent / "noise_robustness_results"
-METHODS = ("spin", "apf_velocity", "cbba")
+MAPPO_RUNS_ROOT = Path(__file__).resolve().parent / "baselines" / "results" / "mappo_convergence_runs"
+METHODS = ("spin", "apf_velocity", "cbba", "mappo")
 MODES = ("tracking", "multi_goal")
 SIGMAS = (0.0, 0.5, 1.0, 2.0, 4.0)
 TRIALS = 5
 STEPS = 120
 AGENTS = 10
+PRETRAIN_EPOCHS = 5000
 BASE_SEED = 7
 MODE_SEED_OFFSET = {"tracking": 0, "multi_goal": 202}
 DISTANCE_STAT_FIELDS = (
@@ -78,6 +79,8 @@ def pretty_method_name(method: str) -> str:
         return "APF-Velocity"
     if method == "cbba":
         return "CBBA"
+    if method == "mappo":
+        return "MAPPO"
     return "SPIN"
 
 
@@ -164,11 +167,51 @@ def _noisy_observation(
     return values + rng.normal(loc=0.0, scale=float(sigma), size=values.shape)
 
 
-def _build_baseline_controller(method: str, n_agents: int):
+def _latest_completed_mappo_run_dir(explicit_run_dir: Path | None = None) -> Path:
+    if explicit_run_dir is not None:
+        run_dir = Path(explicit_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"MAPPO run directory does not exist: {run_dir}")
+        return run_dir
+
+    if not MAPPO_RUNS_ROOT.exists():
+        raise FileNotFoundError(
+            f"No MAPPO convergence runs found under: {MAPPO_RUNS_ROOT}"
+        )
+
+    candidates = sorted(
+        [path for path in MAPPO_RUNS_ROOT.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        if all(
+            (run_dir / "training" / "mappo" / mode / "convergence" / "converged_model" / "actor.pt").exists()
+            for mode in MODES
+        ):
+            return run_dir
+    raise FileNotFoundError(
+        f"No completed MAPPO convergence run with converged checkpoints for modes {MODES} was found."
+    )
+
+
+def _build_baseline_controller(method: str, n_agents: int, mappo_run_dir: Path | None = None, *, mode: str | None = None):
     if method == "apf_velocity":
         return APFVelocityController(n_agents=n_agents)
     if method == "cbba":
         return DistributedAuctionCBBAController(n_agents=n_agents)
+    if method == "mappo":
+        if mode is None:
+            raise ValueError("MAPPO controller construction requires a mode.")
+        run_dir = _latest_completed_mappo_run_dir(mappo_run_dir)
+        model_dir = run_dir / "training" / "mappo" / mode / "convergence" / "converged_model"
+        return build_reference_mappo_controller_from_checkpoint(
+            mode=mode,
+            n_agents=n_agents,
+            steps=STEPS,
+            model_dir=model_dir,
+            seed=BASE_SEED + MODE_SEED_OFFSET[mode],
+        )
     raise ValueError(f"Unsupported baseline method: {method}")
 
 
@@ -232,11 +275,12 @@ def run_noisy_baseline_episode(
     steps: int,
     seed: int,
     noise_sigma: float,
+    controller=None,
 ) -> dict[str, float | int | str]:
     env = _make_env(mode=mode, n_agents=n_agents, steps=steps)
     env.reset(seed=seed)
     rng = np.random.default_rng(seed + 12345)
-    controller = _build_baseline_controller(method, n_agents)
+    controller = controller or _build_baseline_controller(method, n_agents, mode=mode)
     controller.reset(seed=seed)
 
     final_task = None
@@ -247,15 +291,17 @@ def run_noisy_baseline_episode(
     for step_idx in range(steps):
         true_positions = env.agent_positions.copy()
         true_landmarks = env.landmark_positions.copy()
+        true_velocities = env.agent_velocities.copy()
         perceived_positions = _noisy_observation(rng, true_positions, noise_sigma)
         perceived_landmarks = _noisy_observation(rng, true_landmarks, noise_sigma)
+        perceived_velocities = _noisy_observation(rng, true_velocities, noise_sigma)
 
         actions, diagnostics = controller.act(
             mode,
             perceived_positions,
             perceived_landmarks,
             step_idx,
-            agent_velocities=env.agent_velocities.copy(),
+            agent_velocities=perceived_velocities,
         )
         _, _, terminations, truncations, _ = env.step(actions)
 
@@ -331,6 +377,7 @@ def plot_summary(summary_rows: list[dict[str, float | int | str]], path: Path) -
         "spin": "#1d4ed8",
         "apf_velocity": "#059669",
         "cbba": "#dc2626",
+        "mappo": "#7c3aed",
     }
 
     for ax, mode in zip(axes, MODES):
@@ -362,20 +409,46 @@ def plot_summary(summary_rows: list[dict[str, float | int | str]], path: Path) -
     plt.close(fig)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Gaussian observation-noise robustness study.")
+    parser.add_argument("--trials", type=int, default=TRIALS)
+    parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument("--agents", type=int, default=AGENTS)
+    parser.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
+    parser.add_argument(
+        "--mappo-run-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a completed MAPPO convergence run directory. Defaults to the most recent completed run.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     OUTDIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(BASE_SEED)
-    phi_omega = pretrain_mlp(epochs=5000)
+    phi_omega = pretrain_mlp(epochs=args.epochs)
+    mappo_run_dir = _latest_completed_mappo_run_dir(args.mappo_run_dir)
+    mappo_controllers = {
+        mode: _build_baseline_controller("mappo", args.agents, mappo_run_dir, mode=mode)
+        for mode in MODES
+    }
+    print(
+        "Including MAPPO from converged checkpoints at: "
+        f"{mappo_run_dir}\n"
+        "Note: MAPPO was trained on clean observations, so the noise study is an out-of-distribution robustness evaluation for MAPPO."
+    )
 
     raw_rows: list[dict[str, float | int | str]] = []
-    total_jobs = len(METHODS) * len(MODES) * len(SIGMAS) * TRIALS
+    total_jobs = len(METHODS) * len(MODES) * len(SIGMAS) * args.trials
     completed = 0
     study_start = time.perf_counter()
 
     for method_idx, method in enumerate(METHODS):
         for mode in MODES:
             for sigma in SIGMAS:
-                for trial_idx in range(TRIALS):
+                for trial_idx in range(args.trials):
                     seed = (
                         BASE_SEED
                         + trial_idx * 1000
@@ -386,15 +459,15 @@ def main() -> None:
                     print(
                         f"[{completed + 1}/{total_jobs}] noise study: "
                         f"method={method}, mode={mode}, sigma={sigma}, "
-                        f"trial={trial_idx + 1}/{TRIALS}, seed={seed}"
+                        f"trial={trial_idx + 1}/{args.trials}, seed={seed}"
                     )
                     job_start = time.perf_counter()
                     if method == "spin":
                         row = run_noisy_spin_episode(
                             phi_omega=phi_omega,
                             mode=mode,
-                            n_agents=AGENTS,
-                            steps=STEPS,
+                            n_agents=args.agents,
+                            steps=args.steps,
                             seed=seed,
                             noise_sigma=sigma,
                         )
@@ -402,10 +475,11 @@ def main() -> None:
                         row = run_noisy_baseline_episode(
                             method=method,
                             mode=mode,
-                            n_agents=AGENTS,
-                            steps=STEPS,
+                            n_agents=args.agents,
+                            steps=args.steps,
                             seed=seed,
                             noise_sigma=sigma,
+                            controller=mappo_controllers.get(mode) if method == "mappo" else None,
                         )
                     raw_rows.append(row)
                     completed += 1
@@ -432,6 +506,11 @@ def main() -> None:
     print(f"Saved noise raw CSV to: {raw_csv}")
     print(f"Saved noise summary CSV to: {summary_csv}")
     print(f"Saved noise robustness figure to: {figure_path}")
+    for controller in mappo_controllers.values():
+        if hasattr(controller, "runner") and hasattr(controller.runner, "envs"):
+            controller.runner.envs.close()
+        if hasattr(controller, "runner") and hasattr(controller.runner, "writter"):
+            controller.runner.writter.close()
 
 
 if __name__ == "__main__":

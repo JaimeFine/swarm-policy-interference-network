@@ -77,7 +77,67 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="MAPPO CPU training thread count.",
     )
+    parser.add_argument(
+        "--mappo-auto-converge",
+        action="store_true",
+        help="Enable periodic deterministic evaluation and early-stop MAPPO after convergence plateaus.",
+    )
+    parser.add_argument(
+        "--mappo-convergence-eval-interval",
+        type=int,
+        default=100_000,
+        help="Evaluate MAPPO convergence every N training env steps.",
+    )
+    parser.add_argument(
+        "--mappo-convergence-min-steps",
+        type=int,
+        default=500_000,
+        help="Do not allow MAPPO early stopping before this many training env steps.",
+    )
+    parser.add_argument(
+        "--mappo-convergence-min-evals",
+        type=int,
+        default=3,
+        help="Minimum number of convergence evaluations before early stopping is allowed.",
+    )
+    parser.add_argument(
+        "--mappo-convergence-patience",
+        type=int,
+        default=4,
+        help="Number of stale convergence evaluations tolerated before stopping MAPPO training.",
+    )
+    parser.add_argument(
+        "--mappo-convergence-tol",
+        type=float,
+        default=0.01,
+        help="Relative improvement threshold required to reset MAPPO convergence patience.",
+    )
+    parser.add_argument(
+        "--mappo-selection-seed-offset",
+        type=int,
+        default=424242,
+        help="Offset added to each MAPPO mode training seed to build the held-out checkpoint-selection seed.",
+    )
+    parser.add_argument(
+        "--mappo-run-tag",
+        type=str,
+        default="",
+        help="Optional folder tag for convergence-aware MAPPO runs.",
+    )
     return parser.parse_args()
+
+
+def build_mappo_convergence_config(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
+    return {
+        "enabled": bool(args.mappo_auto_converge),
+        "eval_interval_steps": int(args.mappo_convergence_eval_interval),
+        "min_steps": int(args.mappo_convergence_min_steps),
+        "min_evals": int(args.mappo_convergence_min_evals),
+        "patience_evals": int(args.mappo_convergence_patience),
+        "improvement_tol": float(args.mappo_convergence_tol),
+        "selection_seed_offset": int(args.mappo_selection_seed_offset),
+        "run_tag": str(args.mappo_run_tag),
+    }
 
 
 def run_deterministic_baseline(
@@ -183,6 +243,7 @@ def main() -> None:
                 outdir=args.outdir,
                 rollout_threads=args.rollout_threads,
                 training_threads=args.train_threads,
+                convergence_config=build_mappo_convergence_config(args),
             )
         except RuntimeError as exc:
             print(f"MAPPO run skipped: {exc}")

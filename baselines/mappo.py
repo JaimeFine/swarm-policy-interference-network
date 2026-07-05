@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import shutil
 import sys
 import time
 import types
@@ -24,6 +26,38 @@ from src.pettingzoo_env import AGENT_BODY_RADIUS, _make_env, scenario_targets
 REFERENCE_ROOT = (
     Path(__file__).resolve().parents[2] / "reference"
 )
+
+
+def _write_csv_rows(path: Path, rows: list[dict[str, float | int | str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _copy_checkpoint(src_dir: Path, dst_dir: Path) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("actor.pt", "critic.pt"):
+        src = src_dir / name
+        if src.exists():
+            shutil.copy2(src, dst_dir / name)
+
+
+def _improvement_fraction(mode: str, best_metric: float, current_metric: float) -> float:
+    scale = max(abs(best_metric), 1.0)
+    if mode == "dispersion":
+        return (current_metric - best_metric) / scale
+    return (best_metric - current_metric) / scale
+
+
+def _is_better_metric(mode: str, current_metric: float, best_metric: float) -> bool:
+    if mode == "dispersion":
+        return current_metric > best_metric
+    return current_metric < best_metric
 
 
 def _ensure_reference_path() -> None:
@@ -273,6 +307,7 @@ def train_reference_mappo(
     run_dir: Path,
     rollout_threads: int,
     training_threads: int,
+    convergence_config: dict[str, float | int | str | bool] | None = None,
 ):
     ensure_reference_mappo_dependencies()
     _ensure_reference_path()
@@ -281,6 +316,82 @@ def train_reference_mappo(
     from onpolicy.runner.shared.mpe_runner import MPERunner as Runner
 
     class ProgressMPERunner(Runner):
+        def _convergence_dir(self) -> Path:
+            return Path(run_dir) / "convergence"
+
+        def _save_status(
+            self,
+            *,
+            status: str,
+            best_metric: float,
+            best_step: int,
+            best_episode: int,
+            evaluations: int,
+            stopped_step: int,
+        ) -> None:
+            convergence_dir = self._convergence_dir()
+            convergence_dir.mkdir(parents=True, exist_ok=True)
+            status_path = convergence_dir / "convergence_status.txt"
+            selection_seed = seed + int((convergence_config or {}).get("selection_seed_offset", 424242))
+            lines = [
+                f"mode={mode}",
+                f"status={status}",
+                f"selection_seed={selection_seed}",
+                f"best_metric={best_metric:.10f}",
+                f"best_step={best_step}",
+                f"best_episode={best_episode}",
+                f"evaluations={evaluations}",
+                f"stopped_step={stopped_step}",
+                f"training_budget_steps={num_env_steps}",
+            ]
+            status_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        def _load_best_checkpoint(self, checkpoint_dir: Path) -> None:
+            import torch
+
+            actor_path = checkpoint_dir / "actor.pt"
+            critic_path = checkpoint_dir / "critic.pt"
+            if actor_path.exists():
+                actor_state_dict = torch.load(actor_path, map_location=self.device)
+                self.policy.actor.load_state_dict(actor_state_dict)
+            if critic_path.exists():
+                critic_state_dict = torch.load(critic_path, map_location=self.device)
+                self.policy.critic.load_state_dict(critic_state_dict)
+
+        def _run_selection_rollout(self, total_num_steps: int, episode_idx: int) -> dict[str, float | int | str]:
+            selection_seed = seed + int((convergence_config or {}).get("selection_seed_offset", 424242))
+            controller = ReferenceMAPPOController(self, n_agents=n_agents)
+            result = rollout_controller(
+                baseline_name="mappo_selection",
+                controller=controller,
+                mode=mode,
+                n_agents=n_agents,
+                steps=steps,
+                seed=selection_seed,
+            )
+            metric = float(result["final_task"])
+            row = {
+                "mode": mode,
+                "selection_seed": selection_seed,
+                "episode": episode_idx + 1,
+                "total_num_steps": total_num_steps,
+                "metric_label": str(result["task_label"]),
+                "final_task": metric,
+                "improvement": float(result["initial_task"]) - metric
+                if mode in {"tracking", "multi_goal"}
+                else metric - float(result["initial_task"]),
+                "final_entropy": float(result["final_entropy"]),
+                "final_spatial_entropy": float(result["final_spatial_entropy"]),
+                "final_voronoi_area_variance": float(result["final_voronoi_area_variance"]),
+                "mean_trajectory_length": float(result["mean_trajectory_length"]),
+            }
+            convergence_dir = self._convergence_dir()
+            convergence_dir.mkdir(parents=True, exist_ok=True)
+            metrics_dir = convergence_dir / "latest_selection_metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            save_metrics(result, metrics_dir)
+            return row
+
         def run(self):
             self.warmup()
 
@@ -291,6 +402,39 @@ def train_reference_mappo(
 
             progress_marks = {0.10, 0.25, 0.50, 0.75, 0.90, 1.00}
             reported_marks: set[float] = set()
+            convergence_enabled = bool((convergence_config or {}).get("enabled", False))
+            convergence_dir = self._convergence_dir()
+            evaluation_history: list[dict[str, float | int | str]] = []
+            patience_evals = int((convergence_config or {}).get("patience_evals", 4))
+            min_evals = int((convergence_config or {}).get("min_evals", 3))
+            min_steps = int((convergence_config or {}).get("min_steps", num_env_steps))
+            eval_interval_steps = int((convergence_config or {}).get("eval_interval_steps", num_env_steps))
+            improvement_tol = float((convergence_config or {}).get("improvement_tol", 0.01))
+            next_eval_step = eval_interval_steps
+            stale_evals = 0
+            best_metric: float | None = None
+            best_step = 0
+            best_episode = -1
+            best_model_dir = convergence_dir / "best_model"
+
+            if convergence_enabled:
+                convergence_dir.mkdir(parents=True, exist_ok=True)
+                selection_seed = seed + int((convergence_config or {}).get("selection_seed_offset", 424242))
+                config_lines = [
+                    f"mode={mode}",
+                    f"training_seed={seed}",
+                    f"selection_seed={selection_seed}",
+                    f"num_env_steps={num_env_steps}",
+                    f"eval_interval_steps={eval_interval_steps}",
+                    f"min_steps={min_steps}",
+                    f"min_evals={min_evals}",
+                    f"patience_evals={patience_evals}",
+                    f"improvement_tol={improvement_tol}",
+                ]
+                (convergence_dir / "convergence_config.txt").write_text(
+                    "\n".join(config_lines) + "\n",
+                    encoding="utf-8",
+                )
 
             for episode in range(episodes):
                 if self.use_linear_lr_decay:
@@ -348,6 +492,104 @@ def train_reference_mappo(
                     train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
                     self.log_train(train_infos, total_num_steps)
                     self.log_env(env_infos, total_num_steps)
+
+                should_eval = convergence_enabled and (
+                    total_num_steps >= next_eval_step or episode == episodes - 1
+                )
+                if should_eval:
+                    print(
+                        f"[mappo-convergence] {mode}: "
+                        f"running selection evaluation at {total_num_steps}/{self.num_env_steps} steps "
+                        f"(episode {episode + 1}/{episodes})"
+                    )
+                    eval_row = self._run_selection_rollout(total_num_steps, episode)
+                    evaluation_history.append(eval_row)
+                    _write_csv_rows(convergence_dir / "evaluation_history.csv", evaluation_history)
+
+                    current_metric = float(eval_row["final_task"])
+                    improved = False
+                    if best_metric is None or _is_better_metric(mode, current_metric, best_metric):
+                        if best_metric is None:
+                            improved = True
+                        else:
+                            improved = (
+                                _improvement_fraction(mode, best_metric, current_metric)
+                                >= improvement_tol
+                            )
+                        if improved or best_metric is None:
+                            best_metric = current_metric
+                            best_step = total_num_steps
+                            best_episode = episode + 1
+                            stale_evals = 0
+                            self.save(episode + 1)
+                            _copy_checkpoint(Path(self.save_dir), best_model_dir)
+                            shutil.copytree(
+                                convergence_dir / "latest_selection_metrics",
+                                convergence_dir / "best_selection_metrics",
+                                dirs_exist_ok=True,
+                            )
+                            print(
+                                f"[mappo-convergence] {mode}: "
+                                f"new best checkpoint at step {best_step} "
+                                f"with final_task={best_metric:.6f}"
+                            )
+                        else:
+                            stale_evals += 1
+                            print(
+                                f"[mappo-convergence] {mode}: "
+                                f"metric={current_metric:.6f} did not beat the best "
+                                f"by tolerance; stale_evals={stale_evals}/{patience_evals}"
+                            )
+                    else:
+                        stale_evals += 1
+                        print(
+                            f"[mappo-convergence] {mode}: "
+                            f"metric={current_metric:.6f} was not better than best={best_metric:.6f}; "
+                            f"stale_evals={stale_evals}/{patience_evals}"
+                        )
+
+                    next_eval_step += eval_interval_steps
+
+                    if (
+                        best_metric is not None
+                        and len(evaluation_history) >= min_evals
+                        and total_num_steps >= min_steps
+                        and stale_evals >= patience_evals
+                    ):
+                        self._load_best_checkpoint(best_model_dir)
+                        _copy_checkpoint(best_model_dir, convergence_dir / "converged_model")
+                        self._save_status(
+                            status="converged",
+                            best_metric=best_metric,
+                            best_step=best_step,
+                            best_episode=best_episode,
+                            evaluations=len(evaluation_history),
+                            stopped_step=total_num_steps,
+                        )
+                        print(
+                            f"[mappo-convergence] {mode}: "
+                            f"early stop triggered at {total_num_steps} steps; "
+                            f"best checkpoint came from step {best_step} "
+                            f"with final_task={best_metric:.6f}"
+                        )
+                        return
+
+            if convergence_enabled and best_metric is not None:
+                self._load_best_checkpoint(best_model_dir)
+                _copy_checkpoint(best_model_dir, convergence_dir / "converged_model")
+                self._save_status(
+                    status="budget_exhausted",
+                    best_metric=best_metric,
+                    best_step=best_step,
+                    best_episode=best_episode,
+                    evaluations=len(evaluation_history),
+                    stopped_step=total_num_steps,
+                )
+                print(
+                    f"[mappo-convergence] {mode}: "
+                    f"training budget exhausted; using best checkpoint from step {best_step} "
+                    f"with final_task={best_metric:.6f}"
+                )
 
     args = _build_args(
         mode=mode,
@@ -466,13 +708,25 @@ def run_reference_mappo_baseline(
     outdir: Path,
     rollout_threads: int,
     training_threads: int,
+    convergence_config: dict[str, float | int | str | bool] | None = None,
 ) -> None:
-    figures_dir = outdir / "figures" / "mappo"
-    results_dir = outdir / "results" / "mappo"
-    train_root = outdir / "results" / "mappo_training"
+    convergence_enabled = bool((convergence_config or {}).get("enabled", False))
+    run_tag = str((convergence_config or {}).get("run_tag", "")).strip()
+    if convergence_enabled:
+        if not run_tag:
+            run_tag = time.strftime("%Y%m%d_%H%M%S")
+        run_root = outdir / "results" / "mappo_convergence_runs" / run_tag
+    else:
+        run_root = outdir
+
+    figures_dir = run_root / "figures" / "mappo"
+    results_dir = run_root / "results" / "mappo"
+    train_root = run_root / "training" / "mappo"
     figures_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
     train_root.mkdir(parents=True, exist_ok=True)
+    if convergence_enabled:
+        print(f"[mappo] convergence-aware outputs will be written under: {run_root}")
 
     representative = []
     rows: list[dict[str, float | int | str]] = []
@@ -491,6 +745,7 @@ def run_reference_mappo_baseline(
             run_dir=mode_run_dir,
             rollout_threads=rollout_threads,
             training_threads=training_threads,
+            convergence_config=convergence_config,
         )
         controller = ReferenceMAPPOController(runner, n_agents=n_agents)
 
@@ -524,3 +779,5 @@ def run_reference_mappo_baseline(
     print(f"Saved mappo summary CSV to: {summary_csv}")
     print(f"Saved mappo trajectories PDF to: {trajectory_pdf}")
     print(f"Saved mappo diagnostics PDF to: {diagnostics_pdf}")
+    if convergence_enabled:
+        print(f"Saved convergence-aware MAPPO run root to: {run_root}")

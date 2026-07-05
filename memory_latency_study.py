@@ -13,6 +13,7 @@ import numpy as np
 
 from baselines.apf_velocity import APFVelocityController
 from baselines.cbba import DistributedAuctionCBBAController
+from baselines.mappo import build_reference_mappo_controller_from_checkpoint
 from src.pettingzoo_env import (
     _make_env,
     compute_target_distance_statistics,
@@ -23,7 +24,8 @@ from src.simulation import pretrain_mlp
 from src.spin_policy import SpinPolicyController
 
 OUTDIR = Path(__file__).resolve().parent / "memory_latency_results"
-METHODS = ("spin", "apf_velocity", "cbba")
+MAPPO_RUNS_ROOT = Path(__file__).resolve().parent / "baselines" / "results" / "mappo_convergence_runs"
+METHODS = ("spin", "apf_velocity", "cbba", "mappo")
 MODES = ("tracking", "multi_goal")
 TRIALS = 5
 STEPS = 120
@@ -65,10 +67,48 @@ def pretty_method_name(method: str) -> str:
         return "APF-Velocity"
     if method == "cbba":
         return "CBBA"
+    if method == "mappo":
+        return "MAPPO"
     return "SPIN"
 
 
-def _build_controller(method: str, *, phi_omega, n_agents: int):
+def _latest_completed_mappo_run_dir(explicit_run_dir: Path | None = None) -> Path:
+    if explicit_run_dir is not None:
+        run_dir = Path(explicit_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"MAPPO run directory does not exist: {run_dir}")
+        return run_dir
+
+    if not MAPPO_RUNS_ROOT.exists():
+        raise FileNotFoundError(
+            f"No MAPPO convergence runs found under: {MAPPO_RUNS_ROOT}"
+        )
+
+    candidates = sorted(
+        [path for path in MAPPO_RUNS_ROOT.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        if all(
+            (run_dir / "training" / "mappo" / mode / "convergence" / "converged_model" / "actor.pt").exists()
+            for mode in MODES
+        ):
+            return run_dir
+    raise FileNotFoundError(
+        f"No completed MAPPO convergence run with converged checkpoints for modes {MODES} was found."
+    )
+
+
+def _build_controller(
+    method: str,
+    *,
+    phi_omega,
+    n_agents: int,
+    steps: int,
+    mode: str,
+    mappo_run_dir: Path | None = None,
+):
     if method == "spin":
         controller = SpinPolicyController(phi_omega=phi_omega, n_agents=n_agents)
         controller.reset()
@@ -77,6 +117,16 @@ def _build_controller(method: str, *, phi_omega, n_agents: int):
         return APFVelocityController(n_agents=n_agents)
     if method == "cbba":
         return DistributedAuctionCBBAController(n_agents=n_agents)
+    if method == "mappo":
+        run_dir = _latest_completed_mappo_run_dir(mappo_run_dir)
+        model_dir = run_dir / "training" / "mappo" / mode / "convergence" / "converged_model"
+        return build_reference_mappo_controller_from_checkpoint(
+            mode=mode,
+            n_agents=n_agents,
+            steps=steps,
+            model_dir=model_dir,
+            seed=BASE_SEED + MODE_SEED_OFFSET[mode],
+        )
     raise ValueError(f"Unsupported method: {method}")
 
 
@@ -112,6 +162,11 @@ def _estimate_numpy_state_bytes(obj, seen: set[int] | None = None) -> int:
 
     if isinstance(obj, np.ndarray):
         return int(obj.nbytes)
+    if hasattr(obj, "numel") and hasattr(obj, "element_size"):
+        try:
+            return int(obj.numel() * obj.element_size())
+        except Exception:
+            pass
     if isinstance(obj, dict):
         return sum(
             _estimate_numpy_state_bytes(key, seen) + _estimate_numpy_state_bytes(value, seen)
@@ -122,6 +177,13 @@ def _estimate_numpy_state_bytes(obj, seen: set[int] | None = None) -> int:
     if hasattr(obj, "__dict__"):
         return sum(_estimate_numpy_state_bytes(value, seen) for value in vars(obj).values())
     return 0
+
+
+def _close_controller(controller) -> None:
+    if hasattr(controller, "runner") and hasattr(controller.runner, "envs"):
+        controller.runner.envs.close()
+    if hasattr(controller, "runner") and hasattr(controller.runner, "writter"):
+        controller.runner.writter.close()
 
 
 def _finalize_measured_values(values: list[float], fallback: list[float]) -> np.ndarray:
@@ -138,11 +200,19 @@ def run_latency_episode(
     steps: int,
     warmup_steps: int,
     seed: int,
+    mappo_run_dir: Path | None = None,
 ) -> dict[str, float | int | str]:
     gc.collect()
     env = _make_env(mode=mode, n_agents=n_agents, steps=steps)
     env.reset(seed=seed)
-    controller = _build_controller(method, phi_omega=phi_omega, n_agents=n_agents)
+    controller = _build_controller(
+        method,
+        phi_omega=phi_omega,
+        n_agents=n_agents,
+        steps=steps,
+        mode=mode,
+        mappo_run_dir=mappo_run_dir,
+    )
     _reset_controller(controller, method, seed)
 
     controller_state_bytes = _estimate_numpy_state_bytes(controller)
@@ -174,6 +244,7 @@ def run_latency_episode(
             break
 
     env.close()
+    _close_controller(controller)
     latencies_ms = _finalize_measured_values(measured_latencies_ms, all_latencies_ms)
     return {
         "method": method,
@@ -200,11 +271,19 @@ def run_memory_episode(
     steps: int,
     warmup_steps: int,
     seed: int,
+    mappo_run_dir: Path | None = None,
 ) -> dict[str, float | int | str]:
     gc.collect()
     env = _make_env(mode=mode, n_agents=n_agents, steps=steps)
     env.reset(seed=seed)
-    controller = _build_controller(method, phi_omega=phi_omega, n_agents=n_agents)
+    controller = _build_controller(
+        method,
+        phi_omega=phi_omega,
+        n_agents=n_agents,
+        steps=steps,
+        mode=mode,
+        mappo_run_dir=mappo_run_dir,
+    )
     _reset_controller(controller, method, seed)
 
     controller_state_bytes = _estimate_numpy_state_bytes(controller)
@@ -228,6 +307,7 @@ def run_memory_episode(
     finally:
         tracemalloc.stop()
         env.close()
+        _close_controller(controller)
 
     peaks_kib = _finalize_measured_values(measured_peaks_kib, all_peaks_kib)
     return {
@@ -251,6 +331,7 @@ def run_benchmark_trial(
     steps: int,
     warmup_steps: int,
     seed: int,
+    mappo_run_dir: Path | None = None,
 ) -> dict[str, float | int | str]:
     latency_row = run_latency_episode(
         method=method,
@@ -260,6 +341,7 @@ def run_benchmark_trial(
         steps=steps,
         warmup_steps=warmup_steps,
         seed=seed,
+        mappo_run_dir=mappo_run_dir,
     )
     memory_row = run_memory_episode(
         method=method,
@@ -269,6 +351,7 @@ def run_benchmark_trial(
         steps=steps,
         warmup_steps=warmup_steps,
         seed=seed,
+        mappo_run_dir=mappo_run_dir,
     )
     return {
         **latency_row,
@@ -335,6 +418,7 @@ def plot_summary(summary_rows: list[dict[str, float | int | str]], path: Path) -
         "spin": "#1d4ed8",
         "apf_velocity": "#059669",
         "cbba": "#dc2626",
+        "mappo": "#7c3aed",
     }
 
     fig, axes = plt.subplots(2, 2, figsize=(12.4, 8.2), constrained_layout=True)
@@ -418,6 +502,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS)
     parser.add_argument("--agents", type=int, default=AGENTS)
     parser.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
+    parser.add_argument(
+        "--mappo-run-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a completed MAPPO convergence run directory. Defaults to the most recent completed run.",
+    )
     return parser.parse_args()
 
 
@@ -426,6 +516,12 @@ def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(BASE_SEED)
     phi_omega = pretrain_mlp(epochs=args.epochs)
+    mappo_run_dir = _latest_completed_mappo_run_dir(args.mappo_run_dir)
+    print(
+        "Including MAPPO from converged checkpoints at: "
+        f"{mappo_run_dir}\n"
+        "Note: this memory/latency study matches MAPPO's clean-observation evaluation setting only when the benchmark uses the same agent count and rollout length as training/test selection."
+    )
 
     raw_rows: list[dict[str, float | int | str]] = []
     total_jobs = len(METHODS) * len(MODES) * args.trials
@@ -455,6 +551,7 @@ def main() -> None:
                     steps=args.steps,
                     warmup_steps=args.warmup_steps,
                     seed=seed,
+                    mappo_run_dir=mappo_run_dir,
                 )
                 raw_rows.append(row)
                 completed += 1
